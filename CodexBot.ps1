@@ -1,23 +1,26 @@
 # ============================================================
-#  CodexBot v1.0 — Auto-approve Codex permission prompts
+#  CodexBot v1.2 — Auto-approve Codex permission prompts
 # ============================================================
-#  Monitors the Codex CLI window and automatically sends "2"
+#  Monitors the Codex desktop app and automatically sends "2"
 #  (Yes, don't ask again) whenever it detects a permission prompt.
+#
+#  Codex desktop app has a LIGHT theme (white background).
+#  Detection: compares consecutive screenshots to detect when UI
+#  stops streaming (stable) and then checks for prompt patterns.
 #
 #  Usage:
 #    pwsh -File CodexBot.ps1                    # defaults
-#    pwsh -File CodexBot.ps1 -Duration 10       # run 10 minutes
-#    pwsh -File CodexBot.ps1 -Interval 10       # check every 10s
-#    pwsh -File CodexBot.ps1 -AnyScreen          # don't restrict to left screen
+#    pwsh -File CodexBot.ps1 -Duration 60       # run 60 minutes
+#    pwsh -File CodexBot.ps1 -Interval 5        # check every 5s
 #
 #  Stop: press 'q' or close the window
 # ============================================================
 
 param(
-    [int]$Duration = 30,        # minutes to run (default 30)
-    [int]$Interval = 8,         # seconds between checks
-    [switch]$AnyScreen,         # allow any screen, not just left
-    [switch]$Debug              # save screenshots for debugging
+    [int]$Duration = 30,
+    [int]$Interval = 6,
+    [switch]$LeftScreenOnly,
+    [switch]$NoSave
 )
 
 # ---- Win32 API ----
@@ -34,40 +37,33 @@ if (-not ([System.Management.Automation.PSTypeName]'CodexBot.Win32').Type) {
         public struct RECT { public int Left, Top, Right, Bottom; }
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
-        [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
 "@ | Out-Null
 }
 
 $w32 = [CodexBot.Win32]
 
-# ---- Configuration ----
+# ---- Config ----
 $deadline = (Get-Date).AddMinutes($Duration)
 $screenshotDir = Join-Path $PSScriptRoot "screenshots"
-if ($Debug -and -not (Test-Path $screenshotDir)) {
-    New-Item -ItemType Directory -Path $screenshotDir | Out-Null
-}
+if (-not (Test-Path $screenshotDir)) { New-Item -ItemType Directory -Path $screenshotDir | Out-Null }
 
-# Left screen bounds (user's setup: vertical 1440x2560 at -1440,-215)
-$leftScreenMinX = -1440
-$leftScreenMaxX = 0
-
-# Stats
 $totalChecks = 0
 $totalApproved = 0
 $startTime = Get-Date
+$prevHash = ""
+$stableCount = 0
 
 # ---- Functions ----
 
 function Find-CodexWindow {
-    # Search by multiple patterns to be more robust
-    $patterns = @("*Codex*", "*codex*", "*CODEX*")
-    foreach ($pattern in $patterns) {
-        $proc = Get-Process | Where-Object {
-            $_.MainWindowTitle -like $pattern -and $_.MainWindowHandle -ne [IntPtr]::Zero
-        } | Select-Object -First 1
-        if ($proc) { return $proc }
-    }
-    return $null
+    $proc = Get-Process -Name "Codex" -ErrorAction SilentlyContinue |
+        Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
+        Select-Object -First 1
+    if ($proc) { return $proc }
+    $proc = Get-Process | Where-Object {
+        $_.MainWindowTitle -like "*Codex*" -and $_.MainWindowHandle -ne [IntPtr]::Zero
+    } | Select-Object -First 1
+    return $proc
 }
 
 function Get-WindowBitmap([IntPtr]$hwnd) {
@@ -79,75 +75,106 @@ function Get-WindowBitmap([IntPtr]$hwnd) {
     $bmp = New-Object System.Drawing.Bitmap($w, $h)
     $gfx = [System.Drawing.Graphics]::FromImage($bmp)
     $hdc = $gfx.GetHdc()
-    $w32::PrintWindow($hwnd, $hdc, 2) | Out-Null   # PW_RENDERFULLCONTENT
+    $w32::PrintWindow($hwnd, $hdc, 2) | Out-Null
     $gfx.ReleaseHdc($hdc)
     $gfx.Dispose()
     return $bmp
 }
 
+function Get-BitmapHash([System.Drawing.Bitmap]$bmp) {
+    # Quick hash of bottom 300px to detect changes
+    if (-not $bmp) { return "" }
+    $w = $bmp.Width; $h = $bmp.Height
+    $sb = [System.Text.StringBuilder]::new()
+    $startY = [math]::Max(0, $h - 300)
+    for ($y = $startY; $y -lt $h; $y += 15) {
+        for ($x = 10; $x -lt $w; $x += [math]::Max(1, [math]::Floor($w / 20))) {
+            $px = $bmp.GetPixel($x, $y)
+            $sb.Append([math]::Floor($px.R / 16)) | Out-Null
+            $sb.Append([math]::Floor($px.G / 16)) | Out-Null
+            $sb.Append([math]::Floor($px.B / 16)) | Out-Null
+        }
+    }
+    return $sb.ToString()
+}
+
 function Test-IsPermissionPrompt([System.Drawing.Bitmap]$bmp) {
-    # Strategy: Codex permission prompts have numbered options (1, 2, 3) in the
-    # bottom portion. The text input mode has a green "send" button circle.
+    # Codex DESKTOP APP — light theme, white background
+    # When idle: text input box at bottom
+    # When prompt: colored buttons/options, dark bands, accent colors
     #
-    # We use TWO signals:
-    #   1. Absence of the green send button (bottom-right) = might be a prompt
-    #   2. Presence of cyan/teal option numbers (bottom-left) = likely a prompt
-    #
-    # Both must agree to trigger approval.
+    # Signals detected in bottom 300px:
+    # A) Blue accent (buttons/links)
+    # B) Green accent (approve buttons)
+    # C) Dark horizontal bands (option containers)
+    # D) Orange/yellow warnings
 
     if (-not $bmp) { return $false }
-    $w = $bmp.Width
-    $h = $bmp.Height
+    $w = $bmp.Width; $h = $bmp.Height
+    if ($w -lt 100 -or $h -lt 100) { return $false }
 
-    # --- Signal 1: Green send button (bottom-right quadrant, last 150px) ---
-    $scanTop = [math]::Max(0, $h - 150)
-    $scanLeftHalf = [math]::Floor($w / 2)
-    $greenCount = 0
-    for ($y = $scanTop; $y -lt $h; $y += 3) {
-        for ($x = $scanLeftHalf; $x -lt $w; $x += 3) {
+    $scanStart = [math]::Max(0, $h - 300)
+
+    # Signal A: Blue accents
+    $blueAccent = 0
+    for ($y = $scanStart; $y -lt $h; $y += 2) {
+        for ($x = 10; $x -lt ($w - 10); $x += 3) {
             $px = $bmp.GetPixel($x, $y)
-            # Green send button: high G, low R, low-mid B
-            if ($px.G -gt 110 -and $px.G -gt ($px.R * 1.5) -and $px.R -lt 100 -and $px.B -lt 120) {
-                $greenCount++
+            if ($px.B -gt 150 -and $px.R -lt 100 -and $px.G -lt 160) {
+                $blueAccent++
             }
         }
     }
-    $hasSendButton = $greenCount -gt 5
 
-    # --- Signal 2: Cyan/teal option number text (bottom-left, last 200px) ---
-    $cyanCount = 0
-    $scanBottomStart = [math]::Max(0, $h - 200)
-    for ($y = $scanBottomStart; $y -lt $h; $y += 3) {
-        for ($x = 10; $x -lt [math]::Min(300, $w); $x += 3) {
+    # Signal B: Green accents
+    $greenAccent = 0
+    for ($y = $scanStart; $y -lt $h; $y += 2) {
+        for ($x = 10; $x -lt ($w - 10); $x += 3) {
             $px = $bmp.GetPixel($x, $y)
-            # Cyan/teal option numbers: high G+B, low R
-            if ($px.G -gt 140 -and $px.B -gt 140 -and $px.R -lt 80) {
-                $cyanCount++
+            if ($px.G -gt 130 -and $px.R -lt 80 -and $px.B -lt 100) {
+                $greenAccent++
             }
         }
     }
-    $hasOptionNumbers = $cyanCount -gt 3
 
-    # --- Signal 3: Look for white/bright text with specific patterns in bottom area ---
-    # Permission prompts typically have more bright text lines in bottom 200px
-    $brightLineCount = 0
-    for ($y = $scanBottomStart; $y -lt $h; $y += 8) {
-        $lineHasBright = $false
-        for ($x = 50; $x -lt [math]::Min(400, $w); $x += 6) {
+    # Signal C: Dark bands
+    $darkBandRows = 0
+    for ($y = $scanStart; $y -lt $h; $y += 4) {
+        $darkInRow = 0
+        $total = 0
+        for ($x = 50; $x -lt ($w - 50); $x += 5) {
             $px = $bmp.GetPixel($x, $y)
-            if ($px.R -gt 200 -and $px.G -gt 200 -and $px.B -gt 200) {
-                $lineHasBright = $true
-                break
+            $total++
+            if ($px.R -lt 60 -and $px.G -lt 60 -and $px.B -lt 60) {
+                $darkInRow++
             }
         }
-        if ($lineHasBright) { $brightLineCount++ }
+        if ($total -gt 0 -and $darkInRow -gt ($total * 0.3)) {
+            $darkBandRows++
+        }
     }
-    $hasMultipleBrightLines = $brightLineCount -gt 3
 
-    # Decision: must NOT have send button AND must have option indicators
-    if (-not $hasSendButton -and ($hasOptionNumbers -or $hasMultipleBrightLines)) {
-        return $true
+    # Signal D: Warning/orange
+    $warningAccent = 0
+    for ($y = $scanStart; $y -lt $h; $y += 3) {
+        for ($x = 10; $x -lt [math]::Min(500, $w); $x += 3) {
+            $px = $bmp.GetPixel($x, $y)
+            if ($px.R -gt 200 -and $px.G -gt 120 -and $px.G -lt 200 -and $px.B -lt 60) {
+                $warningAccent++
+            }
+        }
     }
+
+    $script:lastSignals = "B:$blueAccent G:$greenAccent D:$darkBandRows W:$warningAccent"
+
+    $hasBlue = $blueAccent -gt 20
+    $hasGreen = $greenAccent -gt 15
+    $hasDark = $darkBandRows -gt 3
+    $hasWarn = $warningAccent -gt 5
+
+    $signalCount = @($hasBlue, $hasGreen, $hasDark, $hasWarn).Where({ $_ }).Count
+    if ($signalCount -ge 2) { return $true }
+    if ($hasDark -and $darkBandRows -gt 6) { return $true }
 
     return $false
 }
@@ -156,141 +183,117 @@ function Send-Approval([IntPtr]$hwnd) {
     $cursorBefore = [System.Windows.Forms.Cursor]::Position
     $prevWindow = $w32::GetForegroundWindow()
 
-    # Restore if minimized, bring to front
-    $w32::ShowWindow($hwnd, 9) | Out-Null   # SW_RESTORE
+    $w32::ShowWindow($hwnd, 9) | Out-Null
     Start-Sleep -Milliseconds 150
     $w32::SetForegroundWindow($hwnd) | Out-Null
+    Start-Sleep -Milliseconds 300
+
+    [System.Windows.Forms.SendKeys]::SendWait("2")
     Start-Sleep -Milliseconds 200
 
-    # Send "2" = "Yes, don't ask again"
-    [System.Windows.Forms.SendKeys]::SendWait("2")
-    Start-Sleep -Milliseconds 100
-
-    # Restore previous window and cursor
     if ($prevWindow -ne [IntPtr]::Zero) {
+        Start-Sleep -Milliseconds 100
         $w32::SetForegroundWindow($prevWindow) | Out-Null
     }
     [System.Windows.Forms.Cursor]::Position = $cursorBefore
 }
 
-function Test-IsOnLeftScreen([IntPtr]$hwnd) {
-    if ($AnyScreen) { return $true }
-    $rc = New-Object CodexBot.Win32+RECT
-    $w32::GetWindowRect($hwnd, [ref]$rc) | Out-Null
-    $cx = ($rc.Left + $rc.Right) / 2
-    return ($cx -ge $leftScreenMinX -and $cx -lt $leftScreenMaxX)
-}
-
-function Write-Status($msg, $color = "Gray") {
+function Write-Status($msg, $color = "Gray", $detail = "") {
     $remaining = [math]::Round(($deadline - (Get-Date)).TotalMinutes, 1)
     $ts = Get-Date -Format 'HH:mm:ss'
     Write-Host "[$ts] " -NoNewline -ForegroundColor DarkGray
     Write-Host "$msg " -NoNewline -ForegroundColor $color
-    Write-Host "(${remaining}m left, ${totalApproved} approved)" -ForegroundColor DarkGray
+    if ($detail) { Write-Host "$detail " -NoNewline -ForegroundColor DarkGray }
+    Write-Host "(${remaining}m | x${totalApproved})" -ForegroundColor DarkGray
 }
 
 # ---- Banner ----
-$banner = @"
+Write-Host @"
 
    ____          _           ____        _
   / ___|___   __| | _____  _| __ )  ___ | |_
- | |   / _ \ / _` |/ _ \ \/ /  _ \ / _ \| __|
+ | |   / _ \ / _`` |/ _ \ \/ /  _ \ / _ \| __|
  | |__| (_) | (_| |  __/>  <| |_) | (_) | |_
-  \____\___/ \__,_|\___/_/\_\____/ \___/ \__|  v1.0
+  \____\___/ \__,_|\___/_/\_\____/ \___/ \__|  v1.2
 
-"@
+"@ -ForegroundColor Cyan
 
-Write-Host $banner -ForegroundColor Cyan
-Write-Host "  Config:" -ForegroundColor White
-Write-Host "    Duration:  $Duration min" -ForegroundColor Gray
-Write-Host "    Interval:  ${Interval}s" -ForegroundColor Gray
-Write-Host "    Screen:    $(if ($AnyScreen) {'Any'} else {'Left only'})" -ForegroundColor Gray
-Write-Host "    Debug:     $(if ($Debug) {'ON (saving screenshots)'} else {'OFF'})" -ForegroundColor Gray
-Write-Host ""
-Write-Host "  Press 'q' to stop" -ForegroundColor Yellow
+Write-Host "  Duration: ${Duration}m  |  Interval: ${Interval}s  |  Press 'q' to stop" -ForegroundColor Gray
+Write-Host "  Screenshots: $screenshotDir" -ForegroundColor DarkGray
 Write-Host "  ────────────────────────────────────────" -ForegroundColor DarkGray
 Write-Host ""
 
 # ---- Main Loop ----
 while ((Get-Date) -lt $deadline) {
-    # Check for quit key
     try {
         if ([Console]::KeyAvailable) {
             $key = [Console]::ReadKey($true)
             if ($key.KeyChar -eq 'q' -or $key.KeyChar -eq 'Q') {
-                Write-Host ""
-                Write-Status "Stopped by user." "Yellow"
-                break
+                Write-Status "Stopped by user." "Yellow"; break
             }
         }
     } catch {}
 
     $totalChecks++
+    $script:lastSignals = ""
 
-    # Find Codex window
     $proc = Find-CodexWindow
     if (-not $proc) {
-        Write-Status "Codex window not found. Waiting..." "DarkYellow"
-        Start-Sleep -Seconds $Interval
-        continue
+        Write-Status "Codex not found..." "DarkYellow"
+        Start-Sleep -Seconds $Interval; continue
     }
 
     $hwnd = $proc.MainWindowHandle
-
-    # Restore if minimized
     if ($w32::IsIconic($hwnd)) {
-        $w32::ShowWindow($hwnd, 4) | Out-Null   # SW_SHOWNOACTIVATE
+        $w32::ShowWindow($hwnd, 4) | Out-Null
         Start-Sleep -Milliseconds 300
     }
 
-    # Check screen position
-    if (-not (Test-IsOnLeftScreen $hwnd)) {
-        Write-Status "Codex on wrong screen. Skipping." "DarkGray"
-        Start-Sleep -Seconds $Interval
-        continue
-    }
-
-    # Capture and analyze
     $bmp = $null
     $isPrompt = $false
     try {
         $bmp = Get-WindowBitmap $hwnd
         if ($bmp) {
-            # Debug: save screenshot
-            if ($Debug) {
+            $hash = Get-BitmapHash $bmp
+            if ($hash -eq $prevHash) { $stableCount++ } else { $stableCount = 0; $prevHash = $hash }
+
+            if (-not $NoSave) {
+                $bmp.Save("$screenshotDir\codex_last.png", [System.Drawing.Imaging.ImageFormat]::Png)
                 $ts = Get-Date -Format 'HHmmss'
                 $bmp.Save("$screenshotDir\codex_$ts.png", [System.Drawing.Imaging.ImageFormat]::Png)
-                # Keep only last 10
-                $old = Get-ChildItem $screenshotDir -Filter "codex_*.png" | Sort-Object LastWriteTime | Select-Object -SkipLast 10
+                $old = Get-ChildItem $screenshotDir -Filter "codex_[0-9]*.png" | Sort-Object LastWriteTime | Select-Object -SkipLast 15
                 foreach ($f in $old) { Remove-Item $f.FullName -Force }
             }
 
-            $isPrompt = Test-IsPermissionPrompt $bmp
-            $bmp.Dispose()
-            $bmp = $null
+            # Only check for prompt if UI is stable (not actively streaming)
+            if ($stableCount -ge 1) {
+                $isPrompt = Test-IsPermissionPrompt $bmp
+            }
+
+            $bmp.Dispose(); $bmp = $null
         }
     } catch {
         if ($bmp) { $bmp.Dispose() }
+        Write-Status "Error: $_" "Red"
     }
 
     if ($isPrompt) {
         Send-Approval $hwnd
         $totalApproved++
-        Write-Status "PROMPT detected! Sent '2' to approve." "Green"
+        $stableCount = 0; $prevHash = ""
+        Write-Status "APPROVED!" "Green" "[$($script:lastSignals)]"
+    } elseif ($stableCount -ge 1) {
+        Write-Status "Stable" "DarkCyan" "[$($script:lastSignals)] s:$stableCount"
     } else {
-        Write-Status "No prompt. Codex working..." "DarkCyan"
+        Write-Status "Streaming..." "DarkCyan"
     }
 
-    # Wait with key check
     for ($i = 0; $i -lt $Interval; $i++) {
         try {
             if ([Console]::KeyAvailable) {
                 $key = [Console]::ReadKey($true)
                 if ($key.KeyChar -eq 'q' -or $key.KeyChar -eq 'Q') {
-                    Write-Host ""
-                    Write-Status "Stopped by user." "Yellow"
-                    $deadline = Get-Date  # exit outer loop
-                    break
+                    Write-Status "Stopped." "Yellow"; $deadline = Get-Date; break
                 }
             }
         } catch {}
@@ -298,14 +301,7 @@ while ((Get-Date) -lt $deadline) {
     }
 }
 
-# ---- Summary ----
 $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
-Write-Host ""
-Write-Host "  ────────────────────────────────────────" -ForegroundColor DarkGray
-Write-Host "  Session Summary:" -ForegroundColor White
-Write-Host "    Runtime:    ${elapsed} min" -ForegroundColor Gray
-Write-Host "    Checks:     $totalChecks" -ForegroundColor Gray
-Write-Host "    Approved:   $totalApproved" -ForegroundColor $(if ($totalApproved -gt 0) {"Green"} else {"Gray"})
-Write-Host "  ────────────────────────────────────────" -ForegroundColor DarkGray
-Write-Host ""
-Write-Host "  CodexBot finished." -ForegroundColor Cyan
+Write-Host "`n  ────────────────────────────────────────" -ForegroundColor DarkGray
+Write-Host "  Runtime: ${elapsed}m | Checks: $totalChecks | Approved: $totalApproved" -ForegroundColor $(if ($totalApproved -gt 0) {"Green"} else {"Gray"})
+Write-Host "  CodexBot finished.`n" -ForegroundColor Cyan
