@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CodexBot — Auto-approve Codex prompts</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+    background: #0a0a0a;
+    color: #e0e0e0;
+    min-height: 100vh;
+    line-height: 1.6;
+  }
+  .container { max-width: 800px; margin: 0 auto; padding: 2rem 1.5rem; }
+
+  /* Header */
+  .header {
+    text-align: center;
+    padding: 3rem 0 2rem;
+    border-bottom: 1px solid #222;
+    margin-bottom: 2rem;
+  }
+  .ascii-art {
+    color: #00ff41;
+    font-size: 0.65rem;
+    line-height: 1.3;
+    white-space: pre;
+    text-shadow: 0 0 10px rgba(0,255,65,0.3);
+    margin-bottom: 1rem;
+  }
+  .tagline {
+    color: #888;
+    font-size: 0.9rem;
+    letter-spacing: 2px;
+  }
+  .version {
+    display: inline-block;
+    background: #00ff41;
+    color: #000;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 0.7rem;
+    font-weight: bold;
+    margin-top: 0.5rem;
+  }
+
+  /* Sections */
+  h2 {
+    color: #00ff41;
+    font-size: 1.1rem;
+    margin: 2rem 0 1rem;
+    padding-bottom: 0.3rem;
+    border-bottom: 1px solid #1a3a1a;
+  }
+  h2::before { content: '> '; color: #555; }
+
+  p { margin-bottom: 1rem; color: #bbb; }
+
+  /* Code blocks */
+  .code {
+    background: #111;
+    border: 1px solid #2a2a2a;
+    border-left: 3px solid #00ff41;
+    padding: 1rem 1.2rem;
+    margin: 0.8rem 0 1.2rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    position: relative;
+  }
+  .code code {
+    color: #00ff41;
+    font-size: 0.85rem;
+    white-space: pre;
+    display: block;
+  }
+  .code .label {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.6rem;
+    font-size: 0.6rem;
+    color: #555;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .code .comment { color: #555; }
+
+  /* OS tabs */
+  .os-tabs {
+    display: flex;
+    gap: 0;
+    margin-top: 1rem;
+  }
+  .os-tab {
+    padding: 0.5rem 1.5rem;
+    background: #111;
+    border: 1px solid #2a2a2a;
+    color: #666;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.8rem;
+    transition: all 0.2s;
+  }
+  .os-tab:first-child { border-radius: 4px 0 0 0; }
+  .os-tab:last-child { border-radius: 0 4px 0 0; }
+  .os-tab.active {
+    background: #1a1a1a;
+    color: #00ff41;
+    border-bottom-color: #1a1a1a;
+  }
+  .os-content {
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-top: none;
+    padding: 1.5rem;
+    border-radius: 0 0 4px 4px;
+    margin-bottom: 1.5rem;
+  }
+  .os-content[hidden] { display: none; }
+
+  /* How it works */
+  .steps {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    margin: 1rem 0;
+  }
+  .step {
+    display: flex;
+    gap: 1rem;
+    align-items: flex-start;
+  }
+  .step-num {
+    background: #00ff41;
+    color: #000;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    font-weight: bold;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
+  .step-text { color: #bbb; font-size: 0.9rem; }
+  .step-text strong { color: #e0e0e0; }
+
+  /* Table */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.85rem;
+  }
+  th { color: #00ff41; text-align: left; padding: 0.5rem; border-bottom: 1px solid #2a2a2a; }
+  td { padding: 0.5rem; border-bottom: 1px solid #151515; color: #aaa; }
+  td code { color: #00ff41; background: #111; padding: 1px 5px; border-radius: 2px; }
+
+  /* Badge */
+  .badge-demo {
+    display: inline-block;
+    background: #2da44e;
+    color: #fff;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+
+  /* Footer */
+  .footer {
+    text-align: center;
+    padding: 2rem 0;
+    margin-top: 2rem;
+    border-top: 1px solid #222;
+    color: #444;
+    font-size: 0.75rem;
+  }
+  .footer a { color: #00ff41; text-decoration: none; }
+
+  /* Features */
+  .features {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin: 1rem 0;
+  }
+  .feature {
+    background: #111;
+    border: 1px solid #1a1a1a;
+    padding: 1rem;
+    border-radius: 4px;
+  }
+  .feature-icon { font-size: 1.5rem; margin-bottom: 0.3rem; }
+  .feature-title { color: #00ff41; font-size: 0.8rem; margin-bottom: 0.3rem; }
+  .feature-desc { color: #777; font-size: 0.75rem; }
+
+  @media (max-width: 600px) {
+    .ascii-art { font-size: 0.4rem; }
+    .features { grid-template-columns: 1fr; }
+    .os-tab { padding: 0.4rem 1rem; font-size: 0.7rem; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+<div class="header">
+<div class="ascii-art">
+   ____          _           ____        _
+  / ___|___   __| | _____  _| __ )  ___ | |_
+ | |   / _ \ / _` |/ _ \ \/ /  _ \ / _ \| __|
+ | |__| (_) | (_| |  __/>  <| |_) | (_) | |_
+  \____\___/ \__,_|\___/_/\_\____/ \___/ \__|
+</div>
+<p class="tagline">Auto-approve Codex permission prompts</p>
+<span class="version">v2.1</span>
+</div>
+
+<h2>Que hace</h2>
+<p>Codex se para constantemente a pedir permisos. CodexBot detecta el badge
+<span class="badge-demo">En espera de aprobacion</span>
+en el sidebar y pulsa <strong>"2"</strong> automaticamente para aprobar.</p>
+
+<div class="features">
+  <div class="feature">
+    <div class="feature-icon">🟢</div>
+    <div class="feature-title">Deteccion por badge verde</div>
+    <div class="feature-desc">Escanea el sidebar buscando el badge verde. 0 falsos positivos.</div>
+  </div>
+  <div class="feature">
+    <div class="feature-icon">🖱️</div>
+    <div class="feature-title">Pausa si usas el raton</div>
+    <div class="feature-desc">No actua si has movido el raton en los ultimos 5 segundos.</div>
+  </div>
+  <div class="feature">
+    <div class="feature-icon">⏱️</div>
+    <div class="feature-title">Configurable</div>
+    <div class="feature-desc">Duracion, intervalo y modo sin screenshots ajustables.</div>
+  </div>
+  <div class="feature">
+    <div class="feature-icon">💻</div>
+    <div class="feature-title">Windows + macOS</div>
+    <div class="feature-desc">PowerShell para Windows, Python para Mac.</div>
+  </div>
+</div>
+
+<h2>Como funciona</h2>
+<div class="steps">
+  <div class="step"><div class="step-num">1</div><div class="step-text">Cada <strong>6 segundos</strong> captura un screenshot de la ventana de Codex</div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-text">Escanea el <strong>sidebar izquierdo</strong> buscando pixeles verdes del badge</div></div>
+  <div class="step"><div class="step-num">3</div><div class="step-text">Si detecta <strong>100+ pixeles verdes</strong> y el raton lleva 5s quieto, trae Codex al frente</div></div>
+  <div class="step"><div class="step-num">4</div><div class="step-text">Envia <strong>"2"</strong> (aprobar y no preguntar mas) y devuelve el foco</div></div>
+</div>
+
+<h2>Arrancar</h2>
+
+<div class="os-tabs">
+  <button class="os-tab active" onclick="showOS('win')">Windows</button>
+  <button class="os-tab" onclick="showOS('mac')">macOS</button>
+</div>
+
+<div class="os-content" id="os-win">
+  <p><strong>1. Clonar el repo</strong> (solo la primera vez):</p>
+  <div class="code"><span class="label">PowerShell</span><code>git clone https://github.com/csilvasantin/CodexBot.git
+cd CodexBot</code></div>
+
+  <p><strong>2. Lanzar</strong> (abre ventana propia):</p>
+  <div class="code"><span class="label">PowerShell</span><code>pwsh -File Launch.ps1</code></div>
+
+  <p><strong>O directamente</strong> (en la misma terminal):</p>
+  <div class="code"><span class="label">PowerShell</span><code>pwsh -File CodexBot.ps1</code></div>
+
+  <p><strong>Con opciones:</strong></p>
+  <div class="code"><span class="label">PowerShell</span><code><span class="comment"># 60 minutos, check cada 4 segundos</span>
+pwsh -File CodexBot.ps1 -Duration 60 -Interval 4</code></div>
+
+  <p><strong>Parar:</strong> pulsa <code>q</code> en la ventana de CodexBot.</p>
+</div>
+
+<div class="os-content" id="os-mac" hidden>
+  <p><strong>1. Instalar dependencias</strong> (solo la primera vez):</p>
+  <div class="code"><span class="label">Terminal</span><code>pip3 install Pillow pyautogui
+git clone https://github.com/csilvasantin/CodexBot.git
+cd CodexBot</code></div>
+
+  <p><strong>2. Dar permisos</strong> (solo la primera vez):</p>
+  <p style="font-size:0.85rem">Ve a <strong>Ajustes del Sistema > Privacidad > Accesibilidad</strong> y <strong>Grabacion de Pantalla</strong> — anade Terminal (o iTerm).</p>
+
+  <p><strong>3. Lanzar:</strong></p>
+  <div class="code"><span class="label">Terminal</span><code>python3 codexbot_mac.py</code></div>
+
+  <p><strong>Con opciones:</strong></p>
+  <div class="code"><span class="label">Terminal</span><code><span class="comment"># 60 minutos, check cada 4 segundos</span>
+python3 codexbot_mac.py -d 60 -i 4</code></div>
+
+  <p><strong>Parar:</strong> <code>Ctrl+C</code></p>
+</div>
+
+<h2>Opciones</h2>
+<table>
+  <tr><th>Param</th><th>Windows</th><th>macOS</th><th>Default</th></tr>
+  <tr><td>Duracion</td><td><code>-Duration 60</code></td><td><code>-d 60</code></td><td>30 min</td></tr>
+  <tr><td>Intervalo</td><td><code>-Interval 4</code></td><td><code>-i 4</code></td><td>6 seg</td></tr>
+  <tr><td>Sin screenshots</td><td><code>-NoSave</code></td><td><code>--no-save</code></td><td>guarda</td></tr>
+  <tr><td>Parar</td><td>tecla <code>q</code></td><td><code>Ctrl+C</code></td><td>—</td></tr>
+</table>
+
+<div class="footer">
+  <a href="https://github.com/csilvasantin/CodexBot">github.com/csilvasantin/CodexBot</a>
+  <br><br>Built with Claude Code
+</div>
+
+</div>
+
+<script>
+function showOS(os) {
+  document.querySelectorAll('.os-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.os-content').forEach(c => c.hidden = true);
+  document.getElementById('os-' + os).hidden = false;
+  event.target.classList.add('active');
+}
+</script>
+</body>
+</html>

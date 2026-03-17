@@ -45,6 +45,9 @@ if (-not (Test-Path $screenshotDir)) { New-Item -ItemType Directory -Path $scree
 $totalChecks = 0
 $totalApproved = 0
 $startTime = Get-Date
+$lastMousePos = [System.Windows.Forms.Cursor]::Position
+$mouseIdleSince = Get-Date
+$mouseIdleThreshold = 5   # seconds mouse must be still before acting
 
 # ---- Functions ----
 
@@ -167,6 +170,18 @@ while ((Get-Date) -lt $deadline) {
 
     $totalChecks++
     $script:lastGreenCount = 0
+
+    # Mouse idle check: skip if user is actively moving the mouse
+    $currentMousePos = [System.Windows.Forms.Cursor]::Position
+    if ($currentMousePos.X -ne $lastMousePos.X -or $currentMousePos.Y -ne $lastMousePos.Y) {
+        $mouseIdleSince = Get-Date
+        $lastMousePos = $currentMousePos
+    }
+    $idleSecs = [math]::Round(((Get-Date) - $mouseIdleSince).TotalSeconds)
+    if ($idleSecs -lt $mouseIdleThreshold) {
+        Write-Status "User active" "DarkGray" "(idle ${idleSecs}s < ${mouseIdleThreshold}s)"
+        Start-Sleep -Seconds $Interval; continue
+    }
 
     $proc = Find-CodexWindow
     if (-not $proc) {
