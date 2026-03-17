@@ -1,17 +1,13 @@
 # ============================================================
-#  CodexBot v1.2 — Auto-approve Codex permission prompts
+#  CodexBot v2.0 — Auto-approve Codex permission prompts
 # ============================================================
-#  Monitors the Codex desktop app and automatically sends "2"
-#  (Yes, don't ask again) whenever it detects a permission prompt.
-#
-#  Codex desktop app has a LIGHT theme (white background).
-#  Detection: compares consecutive screenshots to detect when UI
-#  stops streaming (stable) and then checks for prompt patterns.
+#  Detects the green "En espera de aprobacion" badge in the
+#  Codex sidebar and sends "2" to auto-approve.
 #
 #  Usage:
-#    pwsh -File CodexBot.ps1                    # defaults
-#    pwsh -File CodexBot.ps1 -Duration 60       # run 60 minutes
-#    pwsh -File CodexBot.ps1 -Interval 5        # check every 5s
+#    pwsh -File CodexBot.ps1                 # defaults (30m, 6s)
+#    pwsh -File CodexBot.ps1 -Duration 60    # run 60 minutes
+#    pwsh -File CodexBot.ps1 -Interval 4     # check every 4s
 #
 #  Stop: press 'q' or close the window
 # ============================================================
@@ -19,7 +15,6 @@
 param(
     [int]$Duration = 30,
     [int]$Interval = 6,
-    [switch]$LeftScreenOnly,
     [switch]$NoSave
 )
 
@@ -50,8 +45,6 @@ if (-not (Test-Path $screenshotDir)) { New-Item -ItemType Directory -Path $scree
 $totalChecks = 0
 $totalApproved = 0
 $startTime = Get-Date
-$prevHash = ""
-$stableCount = 0
 
 # ---- Functions ----
 
@@ -60,10 +53,9 @@ function Find-CodexWindow {
         Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
         Select-Object -First 1
     if ($proc) { return $proc }
-    $proc = Get-Process | Where-Object {
+    Get-Process | Where-Object {
         $_.MainWindowTitle -like "*Codex*" -and $_.MainWindowHandle -ne [IntPtr]::Zero
     } | Select-Object -First 1
-    return $proc
 }
 
 function Get-WindowBitmap([IntPtr]$hwnd) {
@@ -81,102 +73,41 @@ function Get-WindowBitmap([IntPtr]$hwnd) {
     return $bmp
 }
 
-function Get-BitmapHash([System.Drawing.Bitmap]$bmp) {
-    # Quick hash of bottom 300px to detect changes
-    if (-not $bmp) { return "" }
-    $w = $bmp.Width; $h = $bmp.Height
-    $sb = [System.Text.StringBuilder]::new()
-    $startY = [math]::Max(0, $h - 300)
-    for ($y = $startY; $y -lt $h; $y += 15) {
-        for ($x = 10; $x -lt $w; $x += [math]::Max(1, [math]::Floor($w / 20))) {
-            $px = $bmp.GetPixel($x, $y)
-            $sb.Append([math]::Floor($px.R / 16)) | Out-Null
-            $sb.Append([math]::Floor($px.G / 16)) | Out-Null
-            $sb.Append([math]::Floor($px.B / 16)) | Out-Null
-        }
-    }
-    return $sb.ToString()
-}
-
-function Test-IsPermissionPrompt([System.Drawing.Bitmap]$bmp) {
-    # Codex DESKTOP APP — light theme, white background
-    # When idle: text input box at bottom
-    # When prompt: colored buttons/options, dark bands, accent colors
+function Test-HasApprovalBadge([System.Drawing.Bitmap]$bmp) {
+    # =============================================================
+    # DETECTION: Green "En espera de aprobacion" badge in sidebar
     #
-    # Signals detected in bottom 300px:
-    # A) Blue accent (buttons/links)
-    # B) Green accent (approve buttons)
-    # C) Dark horizontal bands (option containers)
-    # D) Orange/yellow warnings
+    # The Codex sidebar (x:0 to ~380px) shows a green badge when
+    # there's a pending permission prompt. This badge has bright
+    # green pixels (G > 140, R < 200, B < 120, G-R > 20).
+    #
+    # When no prompt: 0 green pixels in sidebar
+    # When prompt:    500+ green pixels in sidebar badge area
+    # Threshold:      100 green pixels = prompt detected
+    # =============================================================
 
     if (-not $bmp) { return $false }
     $w = $bmp.Width; $h = $bmp.Height
-    if ($w -lt 100 -or $h -lt 100) { return $false }
+    if ($w -lt 200 -or $h -lt 200) { return $false }
 
-    $scanStart = [math]::Max(0, $h - 300)
+    # Scan sidebar area (x: 0-400, y: 150-500 where the badge appears)
+    $sidebarW = [math]::Min(400, [math]::Floor($w * 0.35))
+    $scanYStart = 150
+    $scanYEnd = [math]::Min(500, [math]::Floor($h * 0.4))
 
-    # Signal A: Blue accents
-    $blueAccent = 0
-    for ($y = $scanStart; $y -lt $h; $y += 2) {
-        for ($x = 10; $x -lt ($w - 10); $x += 3) {
+    $greenPixels = 0
+    for ($y = $scanYStart; $y -lt $scanYEnd; $y += 1) {
+        for ($x = 0; $x -lt $sidebarW; $x += 2) {
             $px = $bmp.GetPixel($x, $y)
-            if ($px.B -gt 150 -and $px.R -lt 100 -and $px.G -lt 160) {
-                $blueAccent++
+            # Green badge: G channel dominant
+            if ($px.G -gt 140 -and $px.R -lt 200 -and $px.B -lt 120 -and ($px.G - $px.R) -gt 20) {
+                $greenPixels++
             }
         }
     }
 
-    # Signal B: Green accents
-    $greenAccent = 0
-    for ($y = $scanStart; $y -lt $h; $y += 2) {
-        for ($x = 10; $x -lt ($w - 10); $x += 3) {
-            $px = $bmp.GetPixel($x, $y)
-            if ($px.G -gt 130 -and $px.R -lt 80 -and $px.B -lt 100) {
-                $greenAccent++
-            }
-        }
-    }
-
-    # Signal C: Dark bands
-    $darkBandRows = 0
-    for ($y = $scanStart; $y -lt $h; $y += 4) {
-        $darkInRow = 0
-        $total = 0
-        for ($x = 50; $x -lt ($w - 50); $x += 5) {
-            $px = $bmp.GetPixel($x, $y)
-            $total++
-            if ($px.R -lt 60 -and $px.G -lt 60 -and $px.B -lt 60) {
-                $darkInRow++
-            }
-        }
-        if ($total -gt 0 -and $darkInRow -gt ($total * 0.3)) {
-            $darkBandRows++
-        }
-    }
-
-    # Signal D: Warning/orange
-    $warningAccent = 0
-    for ($y = $scanStart; $y -lt $h; $y += 3) {
-        for ($x = 10; $x -lt [math]::Min(500, $w); $x += 3) {
-            $px = $bmp.GetPixel($x, $y)
-            if ($px.R -gt 200 -and $px.G -gt 120 -and $px.G -lt 200 -and $px.B -lt 60) {
-                $warningAccent++
-            }
-        }
-    }
-
-    $script:lastSignals = "B:$blueAccent G:$greenAccent D:$darkBandRows W:$warningAccent"
-
-    $hasBlue = $blueAccent -gt 20
-    $hasGreen = $greenAccent -gt 15
-    $hasDark = $darkBandRows -gt 3
-    $hasWarn = $warningAccent -gt 5
-
-    $signalCount = @($hasBlue, $hasGreen, $hasDark, $hasWarn).Where({ $_ }).Count
-    if ($signalCount -ge 2) { return $true }
-    if ($hasDark -and $darkBandRows -gt 6) { return $true }
-
-    return $false
+    $script:lastGreenCount = $greenPixels
+    return $greenPixels -gt 100
 }
 
 function Send-Approval([IntPtr]$hwnd) {
@@ -188,9 +119,11 @@ function Send-Approval([IntPtr]$hwnd) {
     $w32::SetForegroundWindow($hwnd) | Out-Null
     Start-Sleep -Milliseconds 300
 
+    # Send "2" = approve and don't ask again
     [System.Windows.Forms.SendKeys]::SendWait("2")
     Start-Sleep -Milliseconds 200
 
+    # Restore previous focus
     if ($prevWindow -ne [IntPtr]::Zero) {
         Start-Sleep -Milliseconds 100
         $w32::SetForegroundWindow($prevWindow) | Out-Null
@@ -214,12 +147,12 @@ Write-Host @"
   / ___|___   __| | _____  _| __ )  ___ | |_
  | |   / _ \ / _`` |/ _ \ \/ /  _ \ / _ \| __|
  | |__| (_) | (_| |  __/>  <| |_) | (_) | |_
-  \____\___/ \__,_|\___/_/\_\____/ \___/ \__|  v1.2
+  \____\___/ \__,_|\___/_/\_\____/ \___/ \__|  v2.0
 
 "@ -ForegroundColor Cyan
 
+Write-Host "  Detects green 'En espera de aprobacion' badge in sidebar" -ForegroundColor White
 Write-Host "  Duration: ${Duration}m  |  Interval: ${Interval}s  |  Press 'q' to stop" -ForegroundColor Gray
-Write-Host "  Screenshots: $screenshotDir" -ForegroundColor DarkGray
 Write-Host "  ────────────────────────────────────────" -ForegroundColor DarkGray
 Write-Host ""
 
@@ -235,7 +168,7 @@ while ((Get-Date) -lt $deadline) {
     } catch {}
 
     $totalChecks++
-    $script:lastSignals = ""
+    $script:lastGreenCount = 0
 
     $proc = Find-CodexWindow
     if (-not $proc) {
@@ -254,22 +187,10 @@ while ((Get-Date) -lt $deadline) {
     try {
         $bmp = Get-WindowBitmap $hwnd
         if ($bmp) {
-            $hash = Get-BitmapHash $bmp
-            if ($hash -eq $prevHash) { $stableCount++ } else { $stableCount = 0; $prevHash = $hash }
-
             if (-not $NoSave) {
                 $bmp.Save("$screenshotDir\codex_last.png", [System.Drawing.Imaging.ImageFormat]::Png)
-                $ts = Get-Date -Format 'HHmmss'
-                $bmp.Save("$screenshotDir\codex_$ts.png", [System.Drawing.Imaging.ImageFormat]::Png)
-                $old = Get-ChildItem $screenshotDir -Filter "codex_[0-9]*.png" | Sort-Object LastWriteTime | Select-Object -SkipLast 15
-                foreach ($f in $old) { Remove-Item $f.FullName -Force }
             }
-
-            # Only check for prompt if UI is stable (not actively streaming)
-            if ($stableCount -ge 1) {
-                $isPrompt = Test-IsPermissionPrompt $bmp
-            }
-
+            $isPrompt = Test-HasApprovalBadge $bmp
             $bmp.Dispose(); $bmp = $null
         }
     } catch {
@@ -278,16 +199,23 @@ while ((Get-Date) -lt $deadline) {
     }
 
     if ($isPrompt) {
+        # Save evidence screenshot before approving
+        if (-not $NoSave) {
+            $ts = Get-Date -Format 'HHmmss'
+            Copy-Item "$screenshotDir\codex_last.png" "$screenshotDir\prompt_$ts.png" -ErrorAction SilentlyContinue
+        }
+
         Send-Approval $hwnd
         $totalApproved++
-        $stableCount = 0; $prevHash = ""
-        Write-Status "APPROVED!" "Green" "[$($script:lastSignals)]"
-    } elseif ($stableCount -ge 1) {
-        Write-Status "Stable" "DarkCyan" "[$($script:lastSignals)] s:$stableCount"
+        Write-Status "APPROVED!" "Green" "[green:$($script:lastGreenCount)px]"
+
+        # Wait extra time after approval for Codex to process
+        Start-Sleep -Seconds 3
     } else {
-        Write-Status "Streaming..." "DarkCyan"
+        Write-Status "No prompt" "DarkCyan" "[green:$($script:lastGreenCount)px]"
     }
 
+    # Wait with quit check
     for ($i = 0; $i -lt $Interval; $i++) {
         try {
             if ([Console]::KeyAvailable) {
@@ -301,6 +229,7 @@ while ((Get-Date) -lt $deadline) {
     }
 }
 
+# ---- Summary ----
 $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
 Write-Host "`n  ────────────────────────────────────────" -ForegroundColor DarkGray
 Write-Host "  Runtime: ${elapsed}m | Checks: $totalChecks | Approved: $totalApproved" -ForegroundColor $(if ($totalApproved -gt 0) {"Green"} else {"Gray"})
