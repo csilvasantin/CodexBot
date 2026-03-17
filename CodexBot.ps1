@@ -114,8 +114,6 @@ function Send-Approval([IntPtr]$hwnd) {
     $cursorBefore = [System.Windows.Forms.Cursor]::Position
     $prevWindow = $w32::GetForegroundWindow()
 
-    $w32::ShowWindow($hwnd, 9) | Out-Null
-    Start-Sleep -Milliseconds 150
     $w32::SetForegroundWindow($hwnd) | Out-Null
     Start-Sleep -Milliseconds 300
 
@@ -177,10 +175,6 @@ while ((Get-Date) -lt $deadline) {
     }
 
     $hwnd = $proc.MainWindowHandle
-    if ($w32::IsIconic($hwnd)) {
-        $w32::ShowWindow($hwnd, 4) | Out-Null
-        Start-Sleep -Milliseconds 300
-    }
 
     $bmp = $null
     $isPrompt = $false
