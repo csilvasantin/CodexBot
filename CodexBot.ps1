@@ -15,7 +15,8 @@
 param(
     [int]$Duration = 30,
     [int]$Interval = 6,
-    [switch]$NoSave
+    [switch]$NoSave,
+    [int]$ExitWhenCodexClosedAfter = 2
 )
 
 # ---- Win32 API ----
@@ -48,6 +49,7 @@ $startTime = Get-Date
 $lastMousePos = [System.Windows.Forms.Cursor]::Position
 $mouseIdleSince = Get-Date
 $mouseIdleThreshold = 5   # seconds mouse must be still before acting
+$missingCodexCount = 0
 
 # ---- Functions ----
 
@@ -59,6 +61,23 @@ function Find-CodexWindow {
     Get-Process | Where-Object {
         $_.MainWindowTitle -like "*Codex*" -and $_.MainWindowHandle -ne [IntPtr]::Zero
     } | Select-Object -First 1
+}
+
+function Wait-OrStop([int]$Seconds) {
+    for ($i = 0; $i -lt $Seconds; $i++) {
+        try {
+            if ([Console]::KeyAvailable) {
+                $key = [Console]::ReadKey($true)
+                if ($key.KeyChar -eq 'q' -or $key.KeyChar -eq 'Q') {
+                    Write-Status "Stopped." "Yellow"
+                    $script:deadline = Get-Date
+                    return $true
+                }
+            }
+        } catch {}
+        Start-Sleep -Seconds 1
+    }
+    return $false
 }
 
 function Get-WindowBitmap([IntPtr]$hwnd) {
@@ -185,9 +204,16 @@ while ((Get-Date) -lt $deadline) {
 
     $proc = Find-CodexWindow
     if (-not $proc) {
-        Write-Status "Codex not found..." "DarkYellow"
-        Start-Sleep -Seconds $Interval; continue
+        $missingCodexCount++
+        Write-Status "Codex not found..." "DarkYellow" "[miss:$missingCodexCount/$ExitWhenCodexClosedAfter]"
+        if ($missingCodexCount -ge $ExitWhenCodexClosedAfter) {
+            Write-Status "Codex closed - exiting bot." "Yellow"
+            break
+        }
+        if (Wait-OrStop $Interval) { break }
+        continue
     }
+    $missingCodexCount = 0
 
     $hwnd = $proc.MainWindowHandle
 
@@ -219,23 +245,13 @@ while ((Get-Date) -lt $deadline) {
         Write-Status "APPROVED!" "Green" "[green:$($script:lastGreenCount)px]"
 
         # Wait extra time after approval for Codex to process
-        Start-Sleep -Seconds 3
+        if (Wait-OrStop 3) { break }
     } else {
         Write-Status "No prompt" "DarkCyan" "[green:$($script:lastGreenCount)px]"
     }
 
     # Wait with quit check
-    for ($i = 0; $i -lt $Interval; $i++) {
-        try {
-            if ([Console]::KeyAvailable) {
-                $key = [Console]::ReadKey($true)
-                if ($key.KeyChar -eq 'q' -or $key.KeyChar -eq 'Q') {
-                    Write-Status "Stopped." "Yellow"; $deadline = Get-Date; break
-                }
-            }
-        } catch {}
-        Start-Sleep -Seconds 1
-    }
+    if (Wait-OrStop $Interval) { break }
 }
 
 # ---- Summary ----
